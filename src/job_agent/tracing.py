@@ -1,10 +1,12 @@
 # tracing.py
 import os
+import httpx
 import logging
 from job_agent.config import get_settings
 from dataclasses import dataclass, field
 from langfuse import Langfuse,get_client
 from typing import Any, Callable, TypeVar
+from pydantic import BaseModel
 from functools import lru_cache
 from langfuse.langchain import CallbackHandler 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
@@ -23,10 +25,25 @@ def configure_langfuse(environment: str = "development", release: str | None = N
         environment=environment,
         release=release,
     )
-    if not client.auth_check():
-        raise ConnectionError("Langfuse auth failed: check keys and host")
-    return client
+    try:
+        authenticated = client.auth_check()
+    except httpx.TimeoutException as exc:
+        raise ConnectionError(
+            f"Langfuse authentication check timed out. "
+            f"Check connectivity to {settings.langfuse_base_url}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ConnectionError(
+            f"Could not connect to Langfuse at "
+            f"{settings.langfuse_base_url}"
+        ) from exc
 
+    if not authenticated:
+        raise ConnectionError(
+            "Langfuse authentication failed: check keys and host"
+        )
+
+    return client
 
 @lru_cache(maxsize=1)
 def _langfuse_client() -> Langfuse | None:
@@ -43,19 +60,27 @@ def _langfuse_client() -> Langfuse | None:
 def traced_call(
     name: str,
     fn: Callable[[], T],
+    input: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[], T]:
     """Wrap ``fn`` so each call runs inside its own Langfuse span."""
     def wrapped() -> T:
         with get_client().start_as_current_observation(
-            name=name, as_type="span", metadata=metadata
+            name=name,input=input, as_type="span", metadata=metadata
         ) as span:
             try:
                 result = fn()
+                # Convert Pydantic models into JSON-compatible dictionaries.
+                if isinstance(result, list):
+                    output = [item.model_dump(mode="json") if isinstance(item, BaseModel) else item for item in result]
+                elif isinstance(result, BaseModel):
+                    output = result.model_dump(mode="json")
+                else:
+                    output = result
             except Exception as e:
                 span.update(level="ERROR", status_message=str(e))
                 raise
-            span.update(output={"count": len(result) if hasattr(result, "__len__") else None})
+            span.update(output={"count": len(result) if hasattr(result, "__len__") else None, "results": output,})
             return result
 
     return wrapped
@@ -115,6 +140,7 @@ from langchain_core.runnables import RunnableConfig
 
 def run_config(
     thread_id: str,
+    run_name:str,
     tracer: Tracer | None,
     usage_cb: UsageMetadataCallbackHandler,
 ) -> RunnableConfig:
@@ -124,14 +150,14 @@ def run_config(
         "configurable": {"thread_id": thread_id},
         "metadata": {
             "thread_id": thread_id,
-            "feature": "job-finder",
+            "feature": run_name,
             "environment": "development",
         },
     }
 
     if tracer:
         config["callbacks"] = [tracer.handler, usage_cb]
-        config["run_name"] = "job-finder"
+        config["run_name"] = run_name
         config["recursion_limit"] = 25
         config["metadata"].update(tracer.metadata)
 
@@ -153,6 +179,7 @@ def langfuse_url(tracer: Tracer | None) -> str:
 
 from pathlib import Path
 from langfuse.api import MediaContentType 
+
 def attach_cv(tracer: Tracer | None, pdf_path: str | Path) -> None:
     """Attach the uploaded CV PDF to the run's trace (best effort, post-run)."""
     if tracer is None or not tracer.trace_id:
@@ -175,38 +202,3 @@ def attach_cv(tracer: Tracer | None, pdf_path: str | Path) -> None:
 
 
 
-
-
-
-"""
-python
-@observe()
-def fetch_jobs(query: str):
-    langfuse = get_client()
-    langfuse.update_current_span(metadata={"query": query, "source": "linkedin"})
-    return ...
------------------------------------------------------------------------------
-from langfuse import get_client
-from langfuse.langchain import CallbackHandler
-langfuse_handler = CallbackHandler()  # uses the client from configure_langfuse()
-result = graph.invoke(
-    {"messages": [("user", "find python jobs")]},
-    config={"callbacks": [langfuse_handler]},
-)
-OR Add trace-level metadata (user, session, tags) via config metadata:
-result = graph.invoke(
-    {"messages": [...]},
-    config={
-        "callbacks": [langfuse_handler],
-        "run_name": "job-agent",
-        "metadata": {
-            "langfuse_user_id": "user_123",
-            "langfuse_session_id": "session_abc",
-            "langfuse_tags": ["job-agent", "prod"],
-            "agent_version": "1.2",   # custom metadata
-        },
-    },
-)
-    
-
-"""
