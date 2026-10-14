@@ -40,24 +40,12 @@ def extract_profile(
     settings = get_settings()
     model_name = model or settings.scout_model
 
-    llm = get_chat_model(
-        model_name,
-        temperature=0.0,
-    ).with_structured_output(Profile)
+    llm = get_chat_model(model_name,temperature=0.0,).with_structured_output(Profile)
 
-    tracer, usage_cb = get_tracer(
-        thread_id=thread_id,
-        user_id=user_id,
-        tags=tags,
-    )
+    tracer, usage_cb = get_tracer(thread_id=thread_id,user_id=user_id,tags=tags,)
 
-    config: RunnableConfig = run_config(
-        thread_id=thread_id,
-        tracer=tracer,
-        usage_cb=usage_cb,
-    )
+    config: RunnableConfig = run_config(thread_id=thread_id,run_name="extract_profile",tracer=tracer,usage_cb=usage_cb,)
 
-    config["run_name"] = "extract_profile"
     config.setdefault("metadata", {}).update({
         "operation": "extract_profile",
         "langfuse_tags": ["extract-profile", *(tags or [])],
