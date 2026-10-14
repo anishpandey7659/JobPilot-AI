@@ -3,7 +3,7 @@
 Behind the tool, ``run_search`` fans out to pluggable ``JobSource`` adapters and
 merges their results:
 
-    JSearch → Adzuna → Remotive → committed cache
+    JSearch → Adzuna → Remotive
 """
 
 from pathlib import Path
@@ -12,11 +12,10 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-
+from concurrent.futures import ThreadPoolExecutor 
 import httpx
 from langchain_core.tools import tool
-from langfuse import get_client
+from langfuse import get_client,observe
 from job_agent.config import get_settings
 from job_agent.graph.schemas import JobPosting
 
@@ -36,6 +35,13 @@ _COUNTRY_CODES: dict[str, str] = {
     "canada": "ca", "france": "fr", "spain": "es", "netherlands": "nl",
     "singapore": "sg", "poland": "pl", "italy": "it",
 }  # fmt: skip
+
+
+# Codes seen in Adzuna's country lists; check Adzuna's docs for the current set
+ADZUNA_COUNTRIES = {
+    "us", "gb", "au", "ca", "de", "fr", "nl", "in", "br",
+    "pl", "nz", "za", "sg", "at", "ch", "it",
+}
 
 
 logger = logging.getLogger(__name__)
@@ -63,14 +69,27 @@ def _failed(source: str, exc: Exception) -> list[JobPosting]:
 
 
 def location_to_country(location: str | None) -> str:
-    """Map a free-text location to a two-letter country code (default ``us``)."""
+    """Map a free-text location to an Adzuna country code (default ``in``)."""
     if not location:
         return DEFAULT_COUNTRY
     loc = location.strip().lower()
     for keyword, code in _COUNTRY_CODES.items():
-        if keyword in loc:
+        if keyword in loc and code in ADZUNA_COUNTRIES:
             return code
     return DEFAULT_COUNTRY
+
+
+def resolve_country(country: str | None, location: str | None) -> str:
+    """Return a supported two-letter Adzuna country code, defaulting to India."""
+    if country:
+        c = country.strip().lower()
+        if c in ADZUNA_COUNTRIES:                 # already a valid code, e.g. "in"
+            return c
+        mapped = _COUNTRY_CODES.get(c)            # a name, e.g. "India"
+        if mapped in ADZUNA_COUNTRIES:
+            return mapped
+    return location_to_country(location)
+
 
 
 def _truncate(text: str) -> str:
@@ -79,15 +98,11 @@ def _truncate(text: str) -> str:
 
 
 class JSearchSource:
-    """Official Google-for-Jobs aggregator (OpenWeb Ninja) with city-level search.
-
-    Location is honoured deterministically: the location is folded into the query
-    (``"<query> in <location>"``) and the country code is derived from it, so a
-    Berlin CV returns Berlin jobs regardless of how the query was phrased.
-    """
+    """JSearch job aggregator accessed through RapidAPI."""
 
     name = "jsearch"
-    BASE = "https://api.openwebninja.com/jsearch/search-v2"
+    BASE = "https://jsearch.p.rapidapi.com/search-v2"
+    HOST = "jsearch.p.rapidapi.com"
 
     def __init__(self, api_key: str = "", timeout: float = 15.0) -> None:
         self.api_key = api_key or get_settings().jsearch_api_key.get_secret_value()
@@ -110,7 +125,7 @@ class JSearchSource:
         if remote:
             params["work_from_home"] = "true"
         try:
-            resp = httpx.get(self.BASE, params=params, headers={"X-API-Key": self.api_key}, timeout=self.timeout)
+            resp = httpx.get(self.BASE, params=params, headers={"X-RapidAPI-Key": self.api_key,"X-RapidAPI-Host": self.HOST,}, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
@@ -132,7 +147,7 @@ class JSearchSource:
     def _to_posting(r: dict) -> JobPosting:
         """Convert one JSearch result into a ``JobPosting``."""
         return JobPosting(
-            job_id=f"jsearch-{r.get('job_id') or r.get('id', '')}",
+            job_id = f"j-{str(r.get('job_id') or r.get('id', ''))[:8]}",
             title=(r.get("job_title") or "").strip() or "Untitled",
             company=(r.get("employer_name") or "").strip() or "Unknown",
             location=JSearchSource._clean_location(r),
@@ -161,11 +176,11 @@ class AdzunaSource:
         """Whether both credentials are configured."""
         return bool(self.app_id and self.app_key)
 
-    def fetch(self, query: str, location: str | None, country: str | None, remote: bool, limit: int) -> list[JobPosting]:
+    def fetch(self, query: str, location: str | None =None, country: str | None= None, remote: bool=True, limit: int =25) -> list[JobPosting]:
         """Fetch postings for one country (derived from ``country`` or the location)."""
         if not self.available:
             return []
-        code = country or location_to_country(location)
+        code = resolve_country(country, location)
         params = {
             "app_id": self.app_id,
             "app_key": self.app_key,
@@ -211,7 +226,7 @@ class RemotiveSource:
     def fetch(self, query: str, location: str | None, country: str | None, remote: bool, limit: int) -> list[JobPosting]:
         """Fetch remote postings matching the query."""
         try:
-            resp = httpx.get(self.BASE, params={"search": query, "limit": limit}, timeout=self.timeout)
+            resp = httpx.get(self.BASE, params={"search": query, "limit": limit,"category": ["Software Development", "Artificial Intelligence"],}, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
@@ -234,39 +249,6 @@ class RemotiveSource:
         )
 
 
-class CacheSource:
-    """Offline fallback: keyword search over the committed ``cached_jobs.json``."""
-
-    name = "cache"
-
-    def __init__(self, path: Path = CACHE_PATH) -> None:
-        self.path = path
-
-    def _load(self) -> list[dict]:
-        """Load the cached postings, or an empty list if the file is missing/invalid."""
-        if not self.path.exists():
-            return []
-        try:
-            return json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-
-    def fetch(self, query: str, location: str | None, country: str | None, remote: bool, limit: int) -> list[JobPosting]:
-        """Rank cached postings by how many query terms they contain."""
-        terms = [t for t in re.split(r"\W+", query.lower()) if t]
-        scored: list[tuple[int, dict]] = []
-        for row in self._load():
-            haystack = f"{row.get('title', '')} {row.get('description', '')} {' '.join(row.get('tags', []))}".lower()
-            score = sum(1 for t in terms if t in haystack) + (1 if remote and row.get("remote") else 0)
-            if score > 0 or not terms:
-                scored.append((score, row))
-        scored.sort(key=lambda s: s[0], reverse=True)
-        return [
-            JobPosting(**{**row, "source": "cache", "description": _truncate(row.get("description", ""))})
-            for _, row in scored[:limit]
-        ]
-
-
 def _dedupe(jobs: list[JobPosting]) -> list[JobPosting]:
     """Drop jobs sharing a ``(title, company)`` with an earlier one."""
     seen: set[tuple[str, str]] = set()
@@ -279,6 +261,12 @@ def _dedupe(jobs: list[JobPosting]) -> list[JobPosting]:
     return out
 
 
+@observe(
+    name="run_search",
+    as_type="span",
+    capture_input=True,
+    capture_output=True,
+)
 def run_search(
     query: str,
     location: str | None = None,
@@ -289,7 +277,6 @@ def run_search(
     jsearch: JSearchSource | None = None,
     adzuna: AdzunaSource | None = None,
     remotive: RemotiveSource | None = None,
-    cache: CacheSource | None = None,
 ) -> tuple[list[JobPosting], list[str]]:
     """Search across the sources in order and return ``(jobs, sources_used)``.
 
@@ -300,7 +287,6 @@ def run_search(
     jsearch = jsearch or JSearchSource()
     adzuna = adzuna or AdzunaSource()
     remotive = remotive or RemotiveSource()
-    cache = cache or CacheSource()
 
     jobs: list[JobPosting] = []
     used: list[str] = []
@@ -308,13 +294,15 @@ def run_search(
     from job_agent.tracing import traced_call
 
     def _spanned(name: str, fn: Callable[[], list[JobPosting]]) -> Callable[[], list[JobPosting]]:
-        return traced_call(f"source.{name}", fn, metadata={"source": name, "query": query, "location": location or ""})
+        return traced_call(f"source.{name}",fn,input={"query": query,"location": location,"country": country,
+        "remote": remote,"limit": limit,},
+        metadata={"source": name},)
 
     fetchers: dict[str, Callable[[], list[JobPosting]]] = {}
     if jsearch.available:
         fetchers["jsearch"] = _spanned("jsearch", lambda: jsearch.fetch(query, location, country, remote, limit))
     fetchers["adzuna"] = _spanned("adzuna", lambda: adzuna.fetch(query, location, country, remote, limit))
-    fetchers["remotive"] = _spanned("remotive", lambda: remotive.fetch(query, location, country, remote, limit))
+    # fetchers["remotive"] = _spanned("remotive", lambda: remotive.fetch(query, location, country, remote, limit))
 
     concurrent = get_settings().scout_concurrent_sources and len(fetchers) > 1
     pool: ThreadPoolExecutor | None = None
@@ -348,17 +336,21 @@ def run_search(
             jobs.extend(found)
 
     try:
+        # First, give the highest-priority source time to respond.
         add("jsearch", fetch("jsearch", timeout=soft_deadline))
+
+        # Give Adzuna a chance to contribute before using the fallback.
         if len(_dedupe(jobs)) < 5:
             add("adzuna", fetch("adzuna"))
-        if remote or len(_dedupe(jobs)) < 5:
-            add("remotive", fetch("remotive"))
+        
+        # Remotive fills remaining capacity, or contributes for remote searches.
+        # I Remove this remote cause The Output was Bad 
+        # if remote or len(_dedupe(jobs)) < 5:
+        #     add("remotive", fetch("remotive"))
 
         if len(_dedupe(jobs)) < 5 and "jsearch" not in used and concurrent:
             add("jsearch", fetch("jsearch"))
 
-        if len(_dedupe(jobs)) < 3:
-            add("cache", cache.fetch(query, location, country, remote, limit))
     finally:
         if pool is not None:
             pool.shutdown(wait=False)
