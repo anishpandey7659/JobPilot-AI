@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     scout_concurrent_sources: bool = Field(default=True, alias="SCOUT_CONCURRENT_SOURCES")
 
     scout_source_soft_deadline: float = Field(
-        default=1.0,
+        default=2.0,
         alias="SCOUT_SOURCE_SOFT_DEADLINE",
         description="Seconds to wait for the first concurrent source before falling through to faster ones.",
     )
