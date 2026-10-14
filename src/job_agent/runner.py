@@ -1,11 +1,4 @@
-"""Run orchestration shared by the Gradio app and the batch runner.
 
-One place builds the tracer, wraps the graph, streams node-level status, measures
-cost and latency, and attaches the CV to the trace, so the UI and batch paths
-cannot drift apart.
-"""
-
-from __future__ import annotations
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
